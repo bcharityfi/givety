@@ -1,0 +1,101 @@
+{
+  "name": "givety",
+  "private": true,
+  "workspaces": {
+    "packages": [
+      "packages/*"
+    ],
+    "nohoist": [
+      "**/web3-eth-abi/@ethersproject/abi",
+      "**/@graphprotocol/*",
+      "**/jest*",
+      "**/@babel/*",
+      "**/babel*",
+      "**/react-scripts"
+    ]
+  },
+  "release": {
+    "extends": "semantic-release-monorepo",
+    "branches": [
+      "master"
+    ],
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      [
+        "@semantic-release/release-notes-generator",
+        {
+          "preset": "angular",
+          "parserOpts": {
+            "headerPattern": "^(\\w*)(?:\\((.*)\\))?!?: (.*)$"
+          }
+        }
+      ],
+      "@semantic-release/npm",
+      "@semantic-release/github"
+    ]
+  },
+  "commitlint": {
+    "extends": [
+      "@commitlint/config-conventional"
+    ]
+  },
+  "scripts": {
+    "build": "run-s build:*",
+    "build:dev-frontend": "yarn workspace @givety/dev-frontend build",
+    "build:subgraph": "yarn workspace @givety/subgraph build",
+    "deploy": "yarn workspace @givety/lib-ethers hardhat deploy",
+    "docs": "run-s docs:*",
+    "docs:collect-sdk-apis": "node scripts/collect-sdk-apis.js",
+    "docs:api-documenter": "api-documenter generate -i temp/sdk-apis -o docs/sdk",
+    "fuzzer": "yarn workspace @givety/fuzzer fuzzer",
+    "prepare": "run-s prepare:*",
+    "prepare:contracts": "yarn workspace @givety/contracts prepare",
+    "prepare:lib-base": "yarn workspace givety-lib-base prepare",
+    "prepare:lib-ethers": "yarn workspace @givety/lib-ethers prepare",
+    "prepare:lib-react": "yarn workspace givety-lib-react prepare",
+    "prepare:lib-subgraph": "yarn workspace @givety/lib-subgraph prepare",
+    "prepare:providers": "yarn workspace givety-providers prepare",
+    "prepare:subgraph": "yarn workspace @givety/subgraph prepare",
+    "prepare:docs": "run-s docs",
+    "rebuild": "run-s prepare build",
+    "release": "run-s release:*",
+    "release:delete-dev-deployments": "yarn workspace @givety/lib-ethers delete-dev-deployments",
+    "release:lib-base": "yarn workspace givety-lib-base semantic-release",
+    "release:lib-ethers": "yarn workspace @givety/lib-ethers semantic-release",
+    "release:providers": "yarn workspace givety-providers semantic-release",
+    "save-live-version": "yarn workspace @givety/lib-ethers save-live-version",
+    "start-dev-chain": "run-s start-dev-chain:*",
+    "start-dev-chain:openethereum": "node dev-chain/start.js",
+    "start-dev-chain:prepare-providers": "yarn prepare:providers",
+    "start-dev-chain:deploy-contracts": "yarn deploy --network dev",
+    "start-dev-chain:prepare-lib-ethers": "yarn prepare:lib-ethers",
+    "stop-dev-chain": "docker kill openethereum",
+    "start-dev-frontend": "yarn workspace @givety/dev-frontend start",
+    "start-demo": "run-s start-demo:*",
+    "start-demo:dev-chain": "yarn start-dev-chain",
+    "start-demo:dev-frontend": "yarn workspace @givety/dev-frontend start-demo",
+    "stop-demo": "yarn stop-dev-chain",
+    "test": "run-s test:*",
+    "test:lib-base": "yarn workspace givety-lib-base test",
+    "test:lib-ethers": "yarn workspace @givety/lib-ethers test",
+    "test:dev-frontend": "run-s --continue-on-error test:dev-frontend:*",
+    "test:dev-frontend:start-dev-chain": "yarn start-dev-chain",
+    "test:dev-frontend:run": "yarn workspace @givety/dev-frontend test --watchAll=false --forceExit --detectOpenHandles",
+    "test:dev-frontend:stop-dev-chain": "yarn stop-dev-chain",
+    "test-contracts": "yarn workspace @givety/contracts test",
+    "test-live": "run-s test-live:*",
+    "test-live:lib-ethers": "yarn workspace @givety/lib-ethers test-live",
+    "coverage": "run-s coverage:*",
+    "coverage:contracts": "yarn workspace @givety/contracts coverage"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^12.0.1",
+    "@commitlint/config-conventional": "^12.0.1",
+    "@microsoft/api-documenter": "^7.12.6",
+    "fs-extra": "^9.1.0",
+    "npm-run-all": "^4.1.5",
+    "prettier": "^2.1.2",
+    "semantic-release": "^17.4.2",
+    "semantic-release-monorepo": "^7.0.4"
+  }
+}

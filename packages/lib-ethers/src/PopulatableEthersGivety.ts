@@ -1,0 +1,1419 @@
+import assert from "assert";
+
+import { BigNumber, BigNumberish } from "@ethersproject/bignumber";
+import { AddressZero } from "@ethersproject/constants";
+import { Log } from "@ethersproject/abstract-provider";
+import { ErrorCode } from "@ethersproject/logger";
+import { Transaction } from "@ethersproject/transactions";
+
+import {
+  CollateralGainTransferDetails,
+  Decimal,
+  Decimalish,
+  LiquidationDetails,
+  GivetyReceipt,
+  GUSD_MINIMUM_DEBT,
+  GUSD_MINIMUM_NET_DEBT,
+  MinedReceipt,
+  PopulatableGivety,
+  PopulatedGivetyTransaction,
+  PopulatedRedemption,
+  RedemptionDetails,
+  SentGivetyTransaction,
+  StabilityDepositChangeDetails,
+  StabilityPoolGainsWithdrawalDetails,
+  Trove,
+  TroveAdjustmentDetails,
+  TroveAdjustmentParams,
+  TroveClosureDetails,
+  TroveCreationDetails,
+  TroveCreationParams,
+  TroveWithPendingRedistribution,
+  _failedReceipt,
+  _normalizeTroveAdjustment,
+  _normalizeTroveCreation,
+  _pendingReceipt,
+  _successfulReceipt
+} from "givety-lib-base";
+
+import {
+  EthersPopulatedTransaction,
+  EthersTransactionOverrides,
+  EthersTransactionReceipt,
+  EthersTransactionResponse
+} from "./types";
+
+import {
+  EthersGivetyConnection,
+  _getContracts,
+  _requireAddress,
+  _requireSigner
+} from "./EthersGivetyConnection";
+
+import { decimalify, promiseAllValues } from "./_utils";
+import { _priceFeedIsTestnet, _givTokenIsMock } from "./contracts";
+import { logsToString } from "./parseLogs";
+import { ReadableEthersGivety } from "./ReadableEthersGivety";
+
+const bigNumberMax = (a: BigNumber, b?: BigNumber) => (b?.gt(a) ? b : a);
+
+// With 70 iterations redemption costs about ~10M gas, and each iteration accounts for ~138k more
+/** @internal */
+export const _redeemMaxIterations = 70;
+
+const defaultBorrowingRateSlippageTolerance = Decimal.from(0.005); // 0.5%
+const defaultRedemptionRateSlippageTolerance = Decimal.from(0.001); // 0.1%
+const defaultBorrowingFeeDecayToleranceMinutes = 10;
+
+const noDetails = () => undefined;
+
+const compose = <T, U, V>(f: (_: U) => V, g: (_: T) => U) => (_: T) => f(g(_));
+
+const id = <T>(t: T) => t;
+
+// Takes ~6-7K (use 10K to be safe) to update lastFeeOperationTime, but the cost of calculating the
+// decayed baseRate increases logarithmically with time elapsed since the last update.
+const addGasForBaseRateUpdate = (maxMinutesSinceLastUpdate = 10) => (gas: BigNumber) =>
+  gas.add(10000 + 1414 * Math.ceil(Math.log2(maxMinutesSinceLastUpdate + 1)));
+
+// First traversal in ascending direction takes ~50K, then ~13.5K per extra step.
+// 80K should be enough for 3 steps, plus some extra to be safe.
+const addGasForPotentialListTraversal = (gas: BigNumber) => gas.add(80000);
+
+const addGasForGVTYIssuance = (gas: BigNumber) => gas.add(50000);
+
+const addGasForGivpoolRewardUpdate = (gas: BigNumber) => gas.add(20000);
+
+// To get the best entropy available, we'd do something like:
+//
+// const bigRandomNumber = () =>
+//   BigNumber.from(
+//     `0x${Array.from(crypto.getRandomValues(new Uint32Array(8)))
+//       .map(u32 => u32.toString(16).padStart(8, "0"))
+//       .join("")}`
+//   );
+//
+// However, Window.crypto is browser-specific. Since we only use this for randomly picking Troves
+// during the search for hints, Math.random() will do fine, too.
+//
+// This returns a random integer between 0 and Number.MAX_SAFE_INTEGER
+const randomInteger = () => Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+
+// Maximum number of trials to perform in a single getApproxHint() call. If the number of trials
+// required to get a statistically "good" hint is larger than this, the search for the hint will
+// be broken up into multiple getApproxHint() calls.
+//
+// This should be low enough to work with popular public Ethereum providers like Infura without
+// triggering any fair use limits.
+const maxNumberOfTrialsAtOnce = 2500;
+
+function* generateTrials(totalNumberOfTrials: number) {
+  assert(Number.isInteger(totalNumberOfTrials) && totalNumberOfTrials > 0);
+
+  while (totalNumberOfTrials) {
+    const numberOfTrials = Math.min(totalNumberOfTrials, maxNumberOfTrialsAtOnce);
+    yield numberOfTrials;
+
+    totalNumberOfTrials -= numberOfTrials;
+  }
+}
+
+/** @internal */
+export enum _RawErrorReason {
+  TRANSACTION_FAILED = "transaction failed",
+  TRANSACTION_CANCELLED = "cancelled",
+  TRANSACTION_REPLACED = "replaced",
+  TRANSACTION_REPRICED = "repriced"
+}
+
+const transactionReplacementReasons: unknown[] = [
+  _RawErrorReason.TRANSACTION_CANCELLED,
+  _RawErrorReason.TRANSACTION_REPLACED,
+  _RawErrorReason.TRANSACTION_REPRICED
+];
+
+interface RawTransactionFailedError extends Error {
+  code: ErrorCode.CALL_EXCEPTION;
+  reason: _RawErrorReason.TRANSACTION_FAILED;
+  transactionHash: string;
+  transaction: Transaction;
+  receipt: EthersTransactionReceipt;
+}
+
+/** @internal */
+export interface _RawTransactionReplacedError extends Error {
+  code: ErrorCode.TRANSACTION_REPLACED;
+  reason:
+    | _RawErrorReason.TRANSACTION_CANCELLED
+    | _RawErrorReason.TRANSACTION_REPLACED
+    | _RawErrorReason.TRANSACTION_REPRICED;
+  cancelled: boolean;
+  hash: string;
+  replacement: EthersTransactionResponse;
+  receipt: EthersTransactionReceipt;
+}
+
+const hasProp = <T, P extends string>(o: T, p: P): o is T & { [_ in P]: unknown } => p in o;
+
+const isTransactionFailedError = (error: Error): error is RawTransactionFailedError =>
+  hasProp(error, "code") &&
+  error.code === ErrorCode.CALL_EXCEPTION &&
+  hasProp(error, "reason") &&
+  error.reason === _RawErrorReason.TRANSACTION_FAILED;
+
+const isTransactionReplacedError = (error: Error): error is _RawTransactionReplacedError =>
+  hasProp(error, "code") &&
+  error.code === ErrorCode.TRANSACTION_REPLACED &&
+  hasProp(error, "reason") &&
+  transactionReplacementReasons.includes(error.reason);
+
+/**
+ * Thrown when a transaction is cancelled or replaced by a different transaction.
+ *
+ * @public
+ */
+export class EthersTransactionCancelledError extends Error {
+  readonly rawReplacementReceipt: EthersTransactionReceipt;
+  readonly rawError: Error;
+
+  /** @internal */
+  constructor(rawError: _RawTransactionReplacedError) {
+    assert(rawError.reason !== _RawErrorReason.TRANSACTION_REPRICED);
+
+    super(`Transaction ${rawError.reason}`);
+    this.name = "TransactionCancelledError";
+    this.rawReplacementReceipt = rawError.receipt;
+    this.rawError = rawError;
+  }
+}
+
+/**
+ * A transaction that has already been sent.
+ *
+ * @remarks
+ * Returned by {@link SendableEthersGivety} functions.
+ *
+ * @public
+ */
+export class SentEthersGivetyTransaction<T = unknown>
+  implements
+    SentGivetyTransaction<EthersTransactionResponse, GivetyReceipt<EthersTransactionReceipt, T>> {
+  /** Ethers' representation of a sent transaction. */
+  readonly rawSentTransaction: EthersTransactionResponse;
+
+  private readonly _connection: EthersGivetyConnection;
+  private readonly _parse: (rawReceipt: EthersTransactionReceipt) => T;
+
+  /** @internal */
+  constructor(
+    rawSentTransaction: EthersTransactionResponse,
+    connection: EthersGivetyConnection,
+    parse: (rawReceipt: EthersTransactionReceipt) => T
+  ) {
+    this.rawSentTransaction = rawSentTransaction;
+    this._connection = connection;
+    this._parse = parse;
+  }
+
+  private _receiptFrom(rawReceipt: EthersTransactionReceipt | null) {
+    return rawReceipt
+      ? rawReceipt.status
+        ? _successfulReceipt(rawReceipt, this._parse(rawReceipt), () =>
+            logsToString(rawReceipt, _getContracts(this._connection))
+          )
+        : _failedReceipt(rawReceipt)
+      : _pendingReceipt;
+  }
+
+  private async _waitForRawReceipt(confirmations?: number) {
+    try {
+      return await this.rawSentTransaction.wait(confirmations);
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        if (isTransactionFailedError(error)) {
+          return error.receipt;
+        }
+
+        if (isTransactionReplacedError(error)) {
+          if (error.cancelled) {
+            throw new EthersTransactionCancelledError(error);
+          } else {
+            return error.receipt;
+          }
+        }
+      }
+
+      throw error;
+    }
+  }
+
+  /** {@inheritDoc givety-lib-base#SentGivetyTransaction.getReceipt} */
+  async getReceipt(): Promise<GivetyReceipt<EthersTransactionReceipt, T>> {
+    return this._receiptFrom(await this._waitForRawReceipt(0));
+  }
+
+  /**
+   * {@inheritDoc givety-lib-base#SentGivetyTransaction.waitForReceipt}
+   *
+   * @throws
+   * Throws {@link EthersTransactionCancelledError} if the transaction is cancelled or replaced.
+   */
+  async waitForReceipt(): Promise<MinedReceipt<EthersTransactionReceipt, T>> {
+    const receipt = this._receiptFrom(await this._waitForRawReceipt());
+
+    assert(receipt.status !== "pending");
+    return receipt;
+  }
+}
+
+/**
+ * Optional parameters of a transaction that borrows GUSD.
+ *
+ * @public
+ */
+export interface BorrowingOperationOptionalParams {
+  /**
+   * Maximum acceptable {@link givety-lib-base#Fees.borrowingRate | borrowing rate}
+   * (default: current borrowing rate plus 0.5%).
+   */
+  maxBorrowingRate?: Decimalish;
+
+  /**
+   * Control the amount of extra gas included attached to the transaction.
+   *
+   * @remarks
+   * Transactions that borrow GUSD must pay a variable borrowing fee, which is added to the Trove's
+   * debt. This fee increases whenever a redemption occurs, and otherwise decays exponentially.
+   * Due to this decay, a Trove's collateral ratio can end up being higher than initially calculated
+   * if the transaction is pending for a long time. When this happens, the backend has to iterate
+   * over the sorted list of Troves to find a new position for the Trove, which costs extra gas.
+   *
+   * The SDK can estimate how much the gas costs of the transaction may increase due to this decay,
+   * and can include additional gas to ensure that it will still succeed, even if it ends up pending
+   * for a relatively long time. This parameter specifies the length of time that should be covered
+   * by the extra gas.
+   *
+   * Default: 10 minutes.
+   */
+  borrowingFeeDecayToleranceMinutes?: number;
+}
+
+const normalizeBorrowingOperationOptionalParams = (
+  maxBorrowingRateOrOptionalParams: Decimalish | BorrowingOperationOptionalParams | undefined,
+  currentBorrowingRate: Decimal | undefined
+): {
+  maxBorrowingRate: Decimal;
+  borrowingFeeDecayToleranceMinutes: number;
+} => {
+  if (maxBorrowingRateOrOptionalParams === undefined) {
+    return {
+      maxBorrowingRate:
+        currentBorrowingRate?.add(defaultBorrowingRateSlippageTolerance) ?? Decimal.ZERO,
+      borrowingFeeDecayToleranceMinutes: defaultBorrowingFeeDecayToleranceMinutes
+    };
+  } else if (
+    typeof maxBorrowingRateOrOptionalParams === "number" ||
+    typeof maxBorrowingRateOrOptionalParams === "string" ||
+    maxBorrowingRateOrOptionalParams instanceof Decimal
+  ) {
+    return {
+      maxBorrowingRate: Decimal.from(maxBorrowingRateOrOptionalParams),
+      borrowingFeeDecayToleranceMinutes: defaultBorrowingFeeDecayToleranceMinutes
+    };
+  } else {
+    const { maxBorrowingRate, borrowingFeeDecayToleranceMinutes } = maxBorrowingRateOrOptionalParams;
+
+    return {
+      maxBorrowingRate:
+        maxBorrowingRate !== undefined
+          ? Decimal.from(maxBorrowingRate)
+          : currentBorrowingRate?.add(defaultBorrowingRateSlippageTolerance) ?? Decimal.ZERO,
+
+      borrowingFeeDecayToleranceMinutes:
+        borrowingFeeDecayToleranceMinutes ?? defaultBorrowingFeeDecayToleranceMinutes
+    };
+  }
+};
+
+/**
+ * A transaction that has been prepared for sending.
+ *
+ * @remarks
+ * Returned by {@link PopulatableEthersGivety} functions.
+ *
+ * @public
+ */
+export class PopulatedEthersGivetyTransaction<T = unknown>
+  implements
+    PopulatedGivetyTransaction<EthersPopulatedTransaction, SentEthersGivetyTransaction<T>> {
+  /** Unsigned transaction object populated by Ethers. */
+  readonly rawPopulatedTransaction: EthersPopulatedTransaction;
+
+  /**
+   * Extra gas added to the transaction's `gasLimit` on top of the estimated minimum requirement.
+   *
+   * @remarks
+   * Gas estimation is based on blockchain state at the latest block. However, most transactions
+   * stay in pending state for several blocks before being included in a block. This may increase
+   * the actual gas requirements of certain Givety transactions by the time they are eventually
+   * mined, therefore the Givety SDK increases these transactions' `gasLimit` by default (unless
+   * `gasLimit` is {@link EthersTransactionOverrides | overridden}).
+   *
+   * Note: even though the SDK includes gas headroom for many transaction types, currently this
+   * property is only implemented for {@link PopulatableEthersGivety.openTrove | openTrove()},
+   * {@link PopulatableEthersGivety.adjustTrove | adjustTrove()} and its aliases.
+   */
+  readonly gasHeadroom?: number;
+
+  private readonly _connection: EthersGivetyConnection;
+  private readonly _parse: (rawReceipt: EthersTransactionReceipt) => T;
+
+  /** @internal */
+  constructor(
+    rawPopulatedTransaction: EthersPopulatedTransaction,
+    connection: EthersGivetyConnection,
+    parse: (rawReceipt: EthersTransactionReceipt) => T,
+    gasHeadroom?: number
+  ) {
+    this.rawPopulatedTransaction = rawPopulatedTransaction;
+    this._connection = connection;
+    this._parse = parse;
+
+    if (gasHeadroom !== undefined) {
+      this.gasHeadroom = gasHeadroom;
+    }
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatedGivetyTransaction.send} */
+  async send(): Promise<SentEthersGivetyTransaction<T>> {
+    return new SentEthersGivetyTransaction(
+      await _requireSigner(this._connection).sendTransaction(this.rawPopulatedTransaction),
+      this._connection,
+      this._parse
+    );
+  }
+}
+
+/**
+ * {@inheritDoc givety-lib-base#PopulatedRedemption}
+ *
+ * @public
+ */
+export class PopulatedEthersRedemption
+  extends PopulatedEthersGivetyTransaction<RedemptionDetails>
+  implements
+    PopulatedRedemption<
+      EthersPopulatedTransaction,
+      EthersTransactionResponse,
+      EthersTransactionReceipt
+    > {
+  /** {@inheritDoc givety-lib-base#PopulatedRedemption.attemptedGUSDAmount} */
+  readonly attemptedGUSDAmount: Decimal;
+
+  /** {@inheritDoc givety-lib-base#PopulatedRedemption.redeemableGUSDAmount} */
+  readonly redeemableGUSDAmount: Decimal;
+
+  /** {@inheritDoc givety-lib-base#PopulatedRedemption.isTruncated} */
+  readonly isTruncated: boolean;
+
+  private readonly _increaseAmountByMinimumNetDebt?: (
+    maxRedemptionRate?: Decimalish
+  ) => Promise<PopulatedEthersRedemption>;
+
+  /** @internal */
+  constructor(
+    rawPopulatedTransaction: EthersPopulatedTransaction,
+    connection: EthersGivetyConnection,
+    attemptedGUSDAmount: Decimal,
+    redeemableGUSDAmount: Decimal,
+    increaseAmountByMinimumNetDebt?: (
+      maxRedemptionRate?: Decimalish
+    ) => Promise<PopulatedEthersRedemption>
+  ) {
+    const { troveManager } = _getContracts(connection);
+
+    super(
+      rawPopulatedTransaction,
+      connection,
+
+      ({ logs }) =>
+        troveManager
+          .extractEvents(logs, "Redemption")
+          .map(({ args: { _GIVESent, _GIVEFee, _actualGUSDAmount, _attemptedGUSDAmount } }) => ({
+            attemptedGUSDAmount: decimalify(_attemptedGUSDAmount),
+            actualGUSDAmount: decimalify(_actualGUSDAmount),
+            collateralTaken: decimalify(_GIVESent),
+            fee: decimalify(_GIVEFee)
+          }))[0]
+    );
+
+    this.attemptedGUSDAmount = attemptedGUSDAmount;
+    this.redeemableGUSDAmount = redeemableGUSDAmount;
+    this.isTruncated = redeemableGUSDAmount.lt(attemptedGUSDAmount);
+    this._increaseAmountByMinimumNetDebt = increaseAmountByMinimumNetDebt;
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatedRedemption.increaseAmountByMinimumNetDebt} */
+  increaseAmountByMinimumNetDebt(
+    maxRedemptionRate?: Decimalish
+  ): Promise<PopulatedEthersRedemption> {
+    if (!this._increaseAmountByMinimumNetDebt) {
+      throw new Error(
+        "PopulatedEthersRedemption: increaseAmountByMinimumNetDebt() can " +
+          "only be called when amount is truncated"
+      );
+    }
+
+    return this._increaseAmountByMinimumNetDebt(maxRedemptionRate);
+  }
+}
+
+/** @internal */
+export interface _TroveChangeWithFees<T> {
+  params: T;
+  newTrove: Trove;
+  fee: Decimal;
+}
+
+/**
+ * Ethers-based implementation of {@link givety-lib-base#PopulatableGivety}.
+ *
+ * @public
+ */
+export class PopulatableEthersGivety
+  implements
+    PopulatableGivety<
+      EthersTransactionReceipt,
+      EthersTransactionResponse,
+      EthersPopulatedTransaction
+    > {
+  private readonly _readable: ReadableEthersGivety;
+
+  constructor(readable: ReadableEthersGivety) {
+    this._readable = readable;
+  }
+
+  private _wrapSimpleTransaction(
+    rawPopulatedTransaction: EthersPopulatedTransaction
+  ): PopulatedEthersGivetyTransaction<void> {
+    return new PopulatedEthersGivetyTransaction(
+      rawPopulatedTransaction,
+      this._readable.connection,
+      noDetails
+    );
+  }
+
+  private _wrapTroveChangeWithFees<T>(
+    params: T,
+    rawPopulatedTransaction: EthersPopulatedTransaction,
+    gasHeadroom?: number
+  ): PopulatedEthersGivetyTransaction<_TroveChangeWithFees<T>> {
+    const { borrowerOperations } = _getContracts(this._readable.connection);
+
+    return new PopulatedEthersGivetyTransaction(
+      rawPopulatedTransaction,
+      this._readable.connection,
+
+      ({ logs }) => {
+        const [newTrove] = borrowerOperations
+          .extractEvents(logs, "TroveUpdated")
+          .map(({ args: { _coll, _debt } }) => new Trove(decimalify(_coll), decimalify(_debt)));
+
+        const [fee] = borrowerOperations
+          .extractEvents(logs, "GUSDBorrowingFeePaid")
+          .map(({ args: { _GUSDFee } }) => decimalify(_GUSDFee));
+
+        return {
+          params,
+          newTrove,
+          fee
+        };
+      },
+
+      gasHeadroom
+    );
+  }
+
+  private async _wrapTroveClosure(
+    rawPopulatedTransaction: EthersPopulatedTransaction
+  ): Promise<PopulatedEthersGivetyTransaction<TroveClosureDetails>> {
+    const { activePool, gusdToken } = _getContracts(this._readable.connection);
+
+    return new PopulatedEthersGivetyTransaction(
+      rawPopulatedTransaction,
+      this._readable.connection,
+
+      ({ logs, from: userAddress }) => {
+        const [repayGUSD] = gusdToken
+          .extractEvents(logs, "Transfer")
+          .filter(({ args: { from, to } }) => from === userAddress && to === AddressZero)
+          .map(({ args: { value } }) => decimalify(value));
+
+        const [withdrawCollateral] = activePool
+          .extractEvents(logs, "EtherSent")
+          .filter(({ args: { _to } }) => _to === userAddress)
+          .map(({ args: { _amount } }) => decimalify(_amount));
+
+        return {
+          params: repayGUSD.nonZero ? { withdrawCollateral, repayGUSD } : { withdrawCollateral }
+        };
+      }
+    );
+  }
+
+  private _wrapLiquidation(
+    rawPopulatedTransaction: EthersPopulatedTransaction
+  ): PopulatedEthersGivetyTransaction<LiquidationDetails> {
+    const { troveManager } = _getContracts(this._readable.connection);
+
+    return new PopulatedEthersGivetyTransaction(
+      rawPopulatedTransaction,
+      this._readable.connection,
+
+      ({ logs }) => {
+        const liquidatedAddresses = troveManager
+          .extractEvents(logs, "TroveLiquidated")
+          .map(({ args: { _borrower } }) => _borrower);
+
+        const [totals] = troveManager
+          .extractEvents(logs, "Liquidation")
+          .map(
+            ({
+              args: { _GUSDGasCompensation, _collGasCompensation, _liquidatedColl, _liquidatedDebt }
+            }) => ({
+              collateralGasCompensation: decimalify(_collGasCompensation),
+              gusdGasCompensation: decimalify(_GUSDGasCompensation),
+              totalLiquidated: new Trove(decimalify(_liquidatedColl), decimalify(_liquidatedDebt))
+            })
+          );
+
+        return {
+          liquidatedAddresses,
+          ...totals
+        };
+      }
+    );
+  }
+
+  private _extractStabilityPoolGainsWithdrawalDetails(
+    logs: Log[]
+  ): StabilityPoolGainsWithdrawalDetails {
+    const { stabilityPool } = _getContracts(this._readable.connection);
+
+    const [newGUSDDeposit] = stabilityPool
+      .extractEvents(logs, "UserDepositChanged")
+      .map(({ args: { _newDeposit } }) => decimalify(_newDeposit));
+
+    const [[collateralGain, gusdLoss]] = stabilityPool
+      .extractEvents(logs, "GIVEGainWithdrawn")
+      .map(({ args: { _GIVE, _GUSDLoss } }) => [decimalify(_GIVE), decimalify(_GUSDLoss)]);
+
+    const [gvtyReward] = stabilityPool
+      .extractEvents(logs, "GVTYPaidToDepositor")
+      .map(({ args: { _GVTY } }) => decimalify(_GVTY));
+
+    return {
+      gusdLoss,
+      newGUSDDeposit,
+      collateralGain,
+      gvtyReward
+    };
+  }
+
+  private _wrapStabilityPoolGainsWithdrawal(
+    rawPopulatedTransaction: EthersPopulatedTransaction
+  ): PopulatedEthersGivetyTransaction<StabilityPoolGainsWithdrawalDetails> {
+    return new PopulatedEthersGivetyTransaction(
+      rawPopulatedTransaction,
+      this._readable.connection,
+      ({ logs }) => this._extractStabilityPoolGainsWithdrawalDetails(logs)
+    );
+  }
+
+  private _wrapStabilityDepositTopup(
+    change: { depositGUSD: Decimal },
+    rawPopulatedTransaction: EthersPopulatedTransaction
+  ): PopulatedEthersGivetyTransaction<StabilityDepositChangeDetails> {
+    return new PopulatedEthersGivetyTransaction(
+      rawPopulatedTransaction,
+      this._readable.connection,
+
+      ({ logs }) => ({
+        ...this._extractStabilityPoolGainsWithdrawalDetails(logs),
+        change
+      })
+    );
+  }
+
+  private async _wrapStabilityDepositWithdrawal(
+    rawPopulatedTransaction: EthersPopulatedTransaction
+  ): Promise<PopulatedEthersGivetyTransaction<StabilityDepositChangeDetails>> {
+    const { stabilityPool, gusdToken } = _getContracts(this._readable.connection);
+
+    return new PopulatedEthersGivetyTransaction(
+      rawPopulatedTransaction,
+      this._readable.connection,
+
+      ({ logs, from: userAddress }) => {
+        const gainsWithdrawalDetails = this._extractStabilityPoolGainsWithdrawalDetails(logs);
+
+        const [withdrawGUSD] = gusdToken
+          .extractEvents(logs, "Transfer")
+          .filter(({ args: { from, to } }) => from === stabilityPool.address && to === userAddress)
+          .map(({ args: { value } }) => decimalify(value));
+
+        return {
+          ...gainsWithdrawalDetails,
+          change: { withdrawGUSD, withdrawAllGUSD: gainsWithdrawalDetails.newGUSDDeposit.isZero }
+        };
+      }
+    );
+  }
+
+  private _wrapCollateralGainTransfer(
+    rawPopulatedTransaction: EthersPopulatedTransaction
+  ): PopulatedEthersGivetyTransaction<CollateralGainTransferDetails> {
+    const { borrowerOperations } = _getContracts(this._readable.connection);
+
+    return new PopulatedEthersGivetyTransaction(
+      rawPopulatedTransaction,
+      this._readable.connection,
+
+      ({ logs }) => {
+        const [newTrove] = borrowerOperations
+          .extractEvents(logs, "TroveUpdated")
+          .map(({ args: { _coll, _debt } }) => new Trove(decimalify(_coll), decimalify(_debt)));
+
+        return {
+          ...this._extractStabilityPoolGainsWithdrawalDetails(logs),
+          newTrove
+        };
+      }
+    );
+  }
+
+  private async _findHintsForNominalCollateralRatio(
+    nominalCollateralRatio: Decimal,
+    ownAddress?: string
+  ): Promise<[string, string]> {
+    const { sortedTroves, hintHelpers } = _getContracts(this._readable.connection);
+    const numberOfTroves = await this._readable.getNumberOfTroves();
+
+    if (!numberOfTroves) {
+      return [AddressZero, AddressZero];
+    }
+
+    if (nominalCollateralRatio.infinite) {
+      return [AddressZero, await sortedTroves.getFirst()];
+    }
+
+    const totalNumberOfTrials = Math.ceil(10 * Math.sqrt(numberOfTroves));
+    const [firstTrials, ...restOfTrials] = generateTrials(totalNumberOfTrials);
+
+    const collectApproxHint = (
+      {
+        latestRandomSeed,
+        results
+      }: {
+        latestRandomSeed: BigNumberish;
+        results: { diff: BigNumber; hintAddress: string }[];
+      },
+      numberOfTrials: number
+    ) =>
+      hintHelpers
+        .getApproxHint(nominalCollateralRatio.hex, numberOfTrials, latestRandomSeed)
+        .then(({ latestRandomSeed, ...result }) => ({
+          latestRandomSeed,
+          results: [...results, result]
+        }));
+
+    const { results } = await restOfTrials.reduce(
+      (p, numberOfTrials) => p.then(state => collectApproxHint(state, numberOfTrials)),
+      collectApproxHint({ latestRandomSeed: randomInteger(), results: [] }, firstTrials)
+    );
+
+    const { hintAddress } = results.reduce((a, b) => (a.diff.lt(b.diff) ? a : b));
+
+    let [prev, next] = await sortedTroves.findInsertPosition(
+      nominalCollateralRatio.hex,
+      hintAddress,
+      hintAddress
+    );
+
+    if (ownAddress) {
+      // In the case of reinsertion, the address of the Trove being reinserted is not a usable hint,
+      // because it is deleted from the list before the reinsertion.
+      // "Jump over" the Trove to get the proper hint.
+      if (prev === ownAddress) {
+        prev = await sortedTroves.getPrev(prev);
+      } else if (next === ownAddress) {
+        next = await sortedTroves.getNext(next);
+      }
+    }
+
+    // Don't use `address(0)` as hint as it can result in huge gas cost.
+    // (See https://github.com/givety/dev/issues/600).
+    if (prev === AddressZero) {
+      prev = next;
+    } else if (next === AddressZero) {
+      next = prev;
+    }
+
+    return [prev, next];
+  }
+
+  private async _findHints(trove: Trove, ownAddress?: string): Promise<[string, string]> {
+    if (trove instanceof TroveWithPendingRedistribution) {
+      throw new Error("Rewards must be applied to this Trove");
+    }
+
+    return this._findHintsForNominalCollateralRatio(trove._nominalCollateralRatio, ownAddress);
+  }
+
+  private async _findRedemptionHints(
+    amount: Decimal
+  ): Promise<
+    [
+      truncatedAmount: Decimal,
+      firstRedemptionHint: string,
+      partialRedemptionUpperHint: string,
+      partialRedemptionLowerHint: string,
+      partialRedemptionHintNICR: BigNumber
+    ]
+  > {
+    const { hintHelpers } = _getContracts(this._readable.connection);
+    const price = await this._readable.getPrice();
+
+    const {
+      firstRedemptionHint,
+      partialRedemptionHintNICR,
+      truncatedGUSDamount
+    } = await hintHelpers.getRedemptionHints(amount.hex, price.hex, _redeemMaxIterations);
+
+    const [
+      partialRedemptionUpperHint,
+      partialRedemptionLowerHint
+    ] = partialRedemptionHintNICR.isZero()
+      ? [AddressZero, AddressZero]
+      : await this._findHintsForNominalCollateralRatio(
+          decimalify(partialRedemptionHintNICR)
+          // XXX: if we knew the partially redeemed Trove's address, we'd pass it here
+        );
+
+    return [
+      decimalify(truncatedGUSDamount),
+      firstRedemptionHint,
+      partialRedemptionUpperHint,
+      partialRedemptionLowerHint,
+      partialRedemptionHintNICR
+    ];
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.openTrove} */
+  async openTrove(
+    params: TroveCreationParams<Decimalish>,
+    maxBorrowingRateOrOptionalParams?: Decimalish | BorrowingOperationOptionalParams,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<TroveCreationDetails>> {
+    const { borrowerOperations } = _getContracts(this._readable.connection);
+
+    const normalizedParams = _normalizeTroveCreation(params);
+    const { depositCollateral, borrowGUSD } = normalizedParams;
+
+    const [fees, blockTimestamp, total, price] = await Promise.all([
+      this._readable._getFeesFactory(),
+      this._readable._getBlockTimestamp(),
+      this._readable.getTotal(),
+      this._readable.getPrice()
+    ]);
+
+    const recoveryMode = total.collateralRatioIsBelowCritical(price);
+
+    const decayBorrowingRate = (seconds: number) =>
+      fees(blockTimestamp + seconds, recoveryMode).borrowingRate();
+
+    const currentBorrowingRate = decayBorrowingRate(0);
+    const newTrove = Trove.create(normalizedParams, currentBorrowingRate);
+    const hints = await this._findHints(newTrove);
+
+    const {
+      maxBorrowingRate,
+      borrowingFeeDecayToleranceMinutes
+    } = normalizeBorrowingOperationOptionalParams(
+      maxBorrowingRateOrOptionalParams,
+      currentBorrowingRate
+    );
+
+    const txParams = (borrowGUSD: Decimal): Parameters<typeof borrowerOperations.openTrove> => [
+      maxBorrowingRate.hex,
+      borrowGUSD.hex,
+      ...hints,
+      { value: depositCollateral.hex, ...overrides }
+    ];
+
+    let gasHeadroom: number | undefined;
+
+    if (overrides?.gasLimit === undefined) {
+      const decayedBorrowingRate = decayBorrowingRate(60 * borrowingFeeDecayToleranceMinutes);
+      const decayedTrove = Trove.create(normalizedParams, decayedBorrowingRate);
+      const { borrowGUSD: borrowGUSDSimulatingDecay } = Trove.recreate(
+        decayedTrove,
+        currentBorrowingRate
+      );
+
+      if (decayedTrove.debt.lt(GUSD_MINIMUM_DEBT)) {
+        throw new Error(
+          `Trove's debt might fall below ${GUSD_MINIMUM_DEBT} ` +
+            `within ${borrowingFeeDecayToleranceMinutes} minutes`
+        );
+      }
+
+      const [gasNow, gasLater] = await Promise.all([
+        borrowerOperations.estimateGas.openTrove(...txParams(borrowGUSD)),
+        borrowerOperations.estimateGas.openTrove(...txParams(borrowGUSDSimulatingDecay))
+      ]);
+
+      const gasLimit = addGasForBaseRateUpdate(borrowingFeeDecayToleranceMinutes)(
+        bigNumberMax(addGasForPotentialListTraversal(gasNow), gasLater)
+      );
+
+      gasHeadroom = gasLimit.sub(gasNow).toNumber();
+      overrides = { ...overrides, gasLimit };
+    }
+
+    return this._wrapTroveChangeWithFees(
+      normalizedParams,
+      await borrowerOperations.populateTransaction.openTrove(...txParams(borrowGUSD)),
+      gasHeadroom
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.closeTrove} */
+  async closeTrove(
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<TroveClosureDetails>> {
+    const { borrowerOperations } = _getContracts(this._readable.connection);
+
+    return this._wrapTroveClosure(
+      await borrowerOperations.estimateAndPopulate.closeTrove({ ...overrides }, id)
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.depositCollateral} */
+  depositCollateral(
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<TroveAdjustmentDetails>> {
+    return this.adjustTrove({ depositCollateral: amount }, undefined, overrides);
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.withdrawCollateral} */
+  withdrawCollateral(
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<TroveAdjustmentDetails>> {
+    return this.adjustTrove({ withdrawCollateral: amount }, undefined, overrides);
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.borrowGUSD} */
+  borrowGUSD(
+    amount: Decimalish,
+    maxBorrowingRate?: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<TroveAdjustmentDetails>> {
+    return this.adjustTrove({ borrowGUSD: amount }, maxBorrowingRate, overrides);
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.repayGUSD} */
+  repayGUSD(
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<TroveAdjustmentDetails>> {
+    return this.adjustTrove({ repayGUSD: amount }, undefined, overrides);
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.adjustTrove} */
+  async adjustTrove(
+    params: TroveAdjustmentParams<Decimalish>,
+    maxBorrowingRateOrOptionalParams?: Decimalish | BorrowingOperationOptionalParams,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<TroveAdjustmentDetails>> {
+    const address = _requireAddress(this._readable.connection, overrides);
+    const { borrowerOperations } = _getContracts(this._readable.connection);
+
+    const normalizedParams = _normalizeTroveAdjustment(params);
+    const { depositCollateral, withdrawCollateral, borrowGUSD, repayGUSD } = normalizedParams;
+
+    const [trove, feeVars] = await Promise.all([
+      this._readable.getTrove(address),
+      borrowGUSD &&
+        promiseAllValues({
+          fees: this._readable._getFeesFactory(),
+          blockTimestamp: this._readable._getBlockTimestamp(),
+          total: this._readable.getTotal(),
+          price: this._readable.getPrice()
+        })
+    ]);
+
+    const decayBorrowingRate = (seconds: number) =>
+      feeVars
+        ?.fees(
+          feeVars.blockTimestamp + seconds,
+          feeVars.total.collateralRatioIsBelowCritical(feeVars.price)
+        )
+        .borrowingRate();
+
+    const currentBorrowingRate = decayBorrowingRate(0);
+    const adjustedTrove = trove.adjust(normalizedParams, currentBorrowingRate);
+    const hints = await this._findHints(adjustedTrove, address);
+
+    const {
+      maxBorrowingRate,
+      borrowingFeeDecayToleranceMinutes
+    } = normalizeBorrowingOperationOptionalParams(
+      maxBorrowingRateOrOptionalParams,
+      currentBorrowingRate
+    );
+
+    const txParams = (borrowGUSD?: Decimal): Parameters<typeof borrowerOperations.adjustTrove> => [
+      maxBorrowingRate.hex,
+      (withdrawCollateral ?? Decimal.ZERO).hex,
+      (borrowGUSD ?? repayGUSD ?? Decimal.ZERO).hex,
+      !!borrowGUSD,
+      ...hints,
+      { value: depositCollateral?.hex, ...overrides }
+    ];
+
+    let gasHeadroom: number | undefined;
+
+    if (overrides?.gasLimit === undefined) {
+      const decayedBorrowingRate = decayBorrowingRate(60 * borrowingFeeDecayToleranceMinutes);
+      const decayedTrove = trove.adjust(normalizedParams, decayedBorrowingRate);
+      const { borrowGUSD: borrowGUSDSimulatingDecay } = trove.adjustTo(
+        decayedTrove,
+        currentBorrowingRate
+      );
+
+      if (decayedTrove.debt.lt(GUSD_MINIMUM_DEBT)) {
+        throw new Error(
+          `Trove's debt might fall below ${GUSD_MINIMUM_DEBT} ` +
+            `within ${borrowingFeeDecayToleranceMinutes} minutes`
+        );
+      }
+
+      const [gasNow, gasLater] = await Promise.all([
+        borrowerOperations.estimateGas.adjustTrove(...txParams(borrowGUSD)),
+        borrowGUSD &&
+          borrowerOperations.estimateGas.adjustTrove(...txParams(borrowGUSDSimulatingDecay))
+      ]);
+
+      let gasLimit = bigNumberMax(addGasForPotentialListTraversal(gasNow), gasLater);
+
+      if (borrowGUSD) {
+        gasLimit = addGasForBaseRateUpdate(borrowingFeeDecayToleranceMinutes)(gasLimit);
+      }
+
+      gasHeadroom = gasLimit.sub(gasNow).toNumber();
+      overrides = { ...overrides, gasLimit };
+    }
+
+    return this._wrapTroveChangeWithFees(
+      normalizedParams,
+      await borrowerOperations.populateTransaction.adjustTrove(...txParams(borrowGUSD)),
+      gasHeadroom
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.claimCollateralSurplus} */
+  async claimCollateralSurplus(
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { borrowerOperations } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await borrowerOperations.estimateAndPopulate.claimCollateral({ ...overrides }, id)
+    );
+  }
+
+  /** @internal */
+  async setPrice(
+    price: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { priceFeed } = _getContracts(this._readable.connection);
+
+    if (!_priceFeedIsTestnet(priceFeed)) {
+      throw new Error("setPrice() unavailable on this deployment of Givety");
+    }
+
+    return this._wrapSimpleTransaction(
+      await priceFeed.estimateAndPopulate.setPrice({ ...overrides }, id, Decimal.from(price).hex)
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.liquidate} */
+  async liquidate(
+    address: string | string[],
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<LiquidationDetails>> {
+    const { troveManager } = _getContracts(this._readable.connection);
+
+    if (Array.isArray(address)) {
+      return this._wrapLiquidation(
+        await troveManager.estimateAndPopulate.batchLiquidateTroves(
+          { ...overrides },
+          addGasForGVTYIssuance,
+          address
+        )
+      );
+    } else {
+      return this._wrapLiquidation(
+        await troveManager.estimateAndPopulate.liquidate(
+          { ...overrides },
+          addGasForGVTYIssuance,
+          address
+        )
+      );
+    }
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.liquidateUpTo} */
+  async liquidateUpTo(
+    maximumNumberOfTrovesToLiquidate: number,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<LiquidationDetails>> {
+    const { troveManager } = _getContracts(this._readable.connection);
+
+    return this._wrapLiquidation(
+      await troveManager.estimateAndPopulate.liquidateTroves(
+        { ...overrides },
+        addGasForGVTYIssuance,
+        maximumNumberOfTrovesToLiquidate
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.depositGUSDInStabilityPool} */
+  async depositGUSDInStabilityPool(
+    amount: Decimalish,
+    frontendTag?: string,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<StabilityDepositChangeDetails>> {
+    const { stabilityPool } = _getContracts(this._readable.connection);
+    const depositGUSD = Decimal.from(amount);
+
+    return this._wrapStabilityDepositTopup(
+      { depositGUSD },
+      await stabilityPool.estimateAndPopulate.provideToSP(
+        { ...overrides },
+        addGasForGVTYIssuance,
+        depositGUSD.hex,
+        frontendTag ?? this._readable.connection.frontendTag ?? AddressZero
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.withdrawGUSDFromStabilityPool} */
+  async withdrawGUSDFromStabilityPool(
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<StabilityDepositChangeDetails>> {
+    const { stabilityPool } = _getContracts(this._readable.connection);
+
+    return this._wrapStabilityDepositWithdrawal(
+      await stabilityPool.estimateAndPopulate.withdrawFromSP(
+        { ...overrides },
+        addGasForGVTYIssuance,
+        Decimal.from(amount).hex
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.withdrawGainsFromStabilityPool} */
+  async withdrawGainsFromStabilityPool(
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<StabilityPoolGainsWithdrawalDetails>> {
+    const { stabilityPool } = _getContracts(this._readable.connection);
+
+    return this._wrapStabilityPoolGainsWithdrawal(
+      await stabilityPool.estimateAndPopulate.withdrawFromSP(
+        { ...overrides },
+        addGasForGVTYIssuance,
+        Decimal.ZERO.hex
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.transferCollateralGainToTrove} */
+  async transferCollateralGainToTrove(
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<CollateralGainTransferDetails>> {
+    const address = _requireAddress(this._readable.connection, overrides);
+    const { stabilityPool } = _getContracts(this._readable.connection);
+
+    const [initialTrove, stabilityDeposit] = await Promise.all([
+      this._readable.getTrove(address),
+      this._readable.getStabilityDeposit(address)
+    ]);
+
+    const finalTrove = initialTrove.addCollateral(stabilityDeposit.collateralGain);
+
+    return this._wrapCollateralGainTransfer(
+      await stabilityPool.estimateAndPopulate.withdrawGIVEGainToTrove(
+        { ...overrides },
+        compose(addGasForPotentialListTraversal, addGasForGVTYIssuance),
+        ...(await this._findHints(finalTrove, address))
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.sendGUSD} */
+  async sendGUSD(
+    toAddress: string,
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { gusdToken } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await gusdToken.estimateAndPopulate.transfer(
+        { ...overrides },
+        id,
+        toAddress,
+        Decimal.from(amount).hex
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.sendGVTY} */
+  async sendGVTY(
+    toAddress: string,
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { gvtyToken } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await gvtyToken.estimateAndPopulate.transfer(
+        { ...overrides },
+        id,
+        toAddress,
+        Decimal.from(amount).hex
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.redeemGUSD} */
+  async redeemGUSD(
+    amount: Decimalish,
+    maxRedemptionRate?: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersRedemption> {
+    const { troveManager } = _getContracts(this._readable.connection);
+    const attemptedGUSDAmount = Decimal.from(amount);
+
+    const [
+      fees,
+      total,
+      [truncatedAmount, firstRedemptionHint, ...partialHints]
+    ] = await Promise.all([
+      this._readable.getFees(),
+      this._readable.getTotal(),
+      this._findRedemptionHints(attemptedGUSDAmount)
+    ]);
+
+    if (truncatedAmount.isZero) {
+      throw new Error(
+        `redeemGUSD: amount too low to redeem (try at least ${GUSD_MINIMUM_NET_DEBT})`
+      );
+    }
+
+    const defaultMaxRedemptionRate = (amount: Decimal) =>
+      Decimal.min(
+        fees.redemptionRate(amount.div(total.debt)).add(defaultRedemptionRateSlippageTolerance),
+        Decimal.ONE
+      );
+
+    const populateRedemption = async (
+      attemptedGUSDAmount: Decimal,
+      maxRedemptionRate?: Decimalish,
+      truncatedAmount: Decimal = attemptedGUSDAmount,
+      partialHints: [string, string, BigNumberish] = [AddressZero, AddressZero, 0]
+    ): Promise<PopulatedEthersRedemption> => {
+      const maxRedemptionRateOrDefault =
+        maxRedemptionRate !== undefined
+          ? Decimal.from(maxRedemptionRate)
+          : defaultMaxRedemptionRate(truncatedAmount);
+
+      return new PopulatedEthersRedemption(
+        await troveManager.estimateAndPopulate.redeemCollateral(
+          { ...overrides },
+          addGasForBaseRateUpdate(),
+          truncatedAmount.hex,
+          firstRedemptionHint,
+          ...partialHints,
+          _redeemMaxIterations,
+          maxRedemptionRateOrDefault.hex
+        ),
+
+        this._readable.connection,
+        attemptedGUSDAmount,
+        truncatedAmount,
+
+        truncatedAmount.lt(attemptedGUSDAmount)
+          ? newMaxRedemptionRate =>
+              populateRedemption(
+                truncatedAmount.add(GUSD_MINIMUM_NET_DEBT),
+                newMaxRedemptionRate ?? maxRedemptionRate
+              )
+          : undefined
+      );
+    };
+
+    return populateRedemption(attemptedGUSDAmount, maxRedemptionRate, truncatedAmount, partialHints);
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.stakeGVTY} */
+  async stakeGVTY(
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { gvtyStaking } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await gvtyStaking.estimateAndPopulate.stake({ ...overrides }, id, Decimal.from(amount).hex)
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.unstakeGVTY} */
+  async unstakeGVTY(
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { gvtyStaking } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await gvtyStaking.estimateAndPopulate.unstake({ ...overrides }, id, Decimal.from(amount).hex)
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.withdrawGainsFromStaking} */
+  withdrawGainsFromStaking(
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    return this.unstakeGVTY(Decimal.ZERO, overrides);
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.registerFrontend} */
+  async registerFrontend(
+    kickbackRate: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { stabilityPool } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await stabilityPool.estimateAndPopulate.registerFrontEnd(
+        { ...overrides },
+        id,
+        Decimal.from(kickbackRate).hex
+      )
+    );
+  }
+
+  /** @internal */
+  async _mintGivToken(
+    amount: Decimalish,
+    address?: string,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    address ??= _requireAddress(this._readable.connection, overrides);
+    const { givToken } = _getContracts(this._readable.connection);
+
+    if (!_givTokenIsMock(givToken)) {
+      throw new Error("_mintGivToken() unavailable on this deployment of Givety");
+    }
+
+    return this._wrapSimpleTransaction(
+      await givToken.estimateAndPopulate.mint(
+        { ...overrides },
+        id,
+        address,
+        Decimal.from(amount).hex
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.approveGivTokens} */
+  async approveGivTokens(
+    allowance?: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { givToken, givpool } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await givToken.estimateAndPopulate.approve(
+        { ...overrides },
+        id,
+        givpool.address,
+        Decimal.from(allowance ?? Decimal.INFINITY).hex
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.stakeGivTokens} */
+  async stakeGivTokens(
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { givpool } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await givpool.estimateAndPopulate.stake(
+        { ...overrides },
+        addGasForGivpoolRewardUpdate,
+        Decimal.from(amount).hex
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.unstakeGivTokens} */
+  async unstakeGivTokens(
+    amount: Decimalish,
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { givpool } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await givpool.estimateAndPopulate.withdraw(
+        { ...overrides },
+        addGasForGivpoolRewardUpdate,
+        Decimal.from(amount).hex
+      )
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.withdrawGVTYRewardFromLiquidityMining} */
+  async withdrawGVTYRewardFromLiquidityMining(
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { givpool } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await givpool.estimateAndPopulate.claimReward({ ...overrides }, addGasForGivpoolRewardUpdate)
+    );
+  }
+
+  /** {@inheritDoc givety-lib-base#PopulatableGivety.exitLiquidityMining} */
+  async exitLiquidityMining(
+    overrides?: EthersTransactionOverrides
+  ): Promise<PopulatedEthersGivetyTransaction<void>> {
+    const { givpool } = _getContracts(this._readable.connection);
+
+    return this._wrapSimpleTransaction(
+      await givpool.estimateAndPopulate.withdrawAndClaim(
+        { ...overrides },
+        addGasForGivpoolRewardUpdate
+      )
+    );
+  }
+}
